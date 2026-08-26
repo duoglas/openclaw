@@ -1,0 +1,77 @@
+name: Fleet Responses WebSocket Focused Validation
+
+on:
+  push:
+    branches:
+      - fleet/responses-websocket
+  workflow_dispatch:
+    inputs:
+      gate:
+        description: Isolated maintenance gate to run
+        required: true
+        default: light
+        type: choice
+        options:
+          - light
+          - full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NODE_VERSION: "24.19.0"
+
+jobs:
+  focused-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout maintenance branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch public upstream ref
+        run: |
+          set -euo pipefail
+          git remote add public-upstream https://github.com/openclaw/openclaw.git
+          git fetch --no-tags public-upstream main:refs/remotes/public-upstream/main
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          cache-mode: restore
+          node-version: ${{ env.NODE_VERSION }}
+          install-bun: "false"
+
+      - name: Test upgrade-check safety
+        run: pnpm test test/scripts/fleet-ws-upgrade-check.test.ts
+
+      - name: Check maintenance freshness
+        run: |
+          scripts/fleet-ws-upgrade-check.sh status \
+            --upstream-ref refs/remotes/public-upstream/main
+
+      - name: Run isolated maintenance gate
+        env:
+          DISPATCH_GATE: ${{ inputs.gate }}
+        run: |
+          set -euo pipefail
+          gate="${DISPATCH_GATE:-light}"
+          scripts/fleet-ws-upgrade-check.sh "dry-run-${gate}" \
+            --upstream-ref refs/remotes/public-upstream/main \
+            --artifact-dir "${RUNNER_TEMP}/fleet-ws-artifacts"
+
+      - name: Upload candidate identity artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fleet-ws-candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fleet-ws-artifacts
+          if-no-files-found: error
+          retention-days: 30

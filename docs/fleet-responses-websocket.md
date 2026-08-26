@@ -50,6 +50,35 @@ maintenance branch with lease protection:
 git push --force-with-lease fork fleet/responses-websocket
 ```
 
+### Fork Actions policy
+
+A maintenance fork inherits every upstream workflow file. Pushing a pinned
+upstream commit to the fork's `main` can therefore fan out release, publishing,
+CodeQL, documentation, and large matrix workflows that are unrelated to the
+fleet patch. That fan-out can leave repository-level workflow admission stuck
+before job creation.
+
+Keep only `Fleet Responses WebSocket Focused Validation` active in the
+maintenance fork. After every fork-`main` sync, audit workflow state and disable
+newly inherited workflows before pushing or dispatching another candidate:
+
+```bash
+gh workflow list --repo YOUR-FORK/openclaw --all
+
+gh api --paginate repos/YOUR-FORK/openclaw/actions/workflows \
+  --jq '.workflows[] | select(.name != "Fleet Responses WebSocket Focused Validation") | .id' \
+  | while read -r workflow_id; do
+      gh api -X PUT "repos/YOUR-FORK/openclaw/actions/workflows/${workflow_id}/disable"
+    done
+```
+
+If a run remains `queued` with zero jobs and both normal and force cancellation
+report that it has not been queued yet, first verify Actions on another small
+repository. If that control run starts, reset this fork's workflow registration
+by disabling and re-enabling the fleet workflow, then dispatch a fresh run. Do
+not treat the old zero-job run as a test failure; preserve its URL as scheduler
+evidence.
+
 Never pull, stash, reset, checkout, or rebase inside a directory used by a live
 OpenClaw process. A dirty live checkout is a stop condition, not permission to
 hide changes with a broad stash.

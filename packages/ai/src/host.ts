@@ -1,3 +1,4 @@
+import type { Agent as HttpAgent } from "node:http";
 // Host policy ports for the reusable transport package. Fetch guarding,
 // secret redaction, strict-tool policy, and diagnostics logging are owned by
 // the embedding application (OpenClaw core installs its implementations via
@@ -28,6 +29,17 @@ export interface AiProviderRequestPolicyInput {
   compat?: unknown;
   model?: object;
 }
+
+/** Node WebSocket connection policy resolved by the embedding host. */
+export type AiWebSocketConnectionOptions = {
+  agent?: HttpAgent;
+  ca?: string | Buffer | Array<string | Buffer>;
+  cert?: string | Buffer | Array<string | Buffer>;
+  key?: string | Buffer | Array<string | Buffer>;
+  passphrase?: string;
+  servername?: string;
+  rejectUnauthorized?: boolean;
+};
 
 /** Context shared by plugin-owned provider stream hooks. */
 export interface AiProviderStreamHookContext {
@@ -174,6 +186,8 @@ export interface AiTransportHost {
   }): Record<string, string> | undefined;
   /** Returns the host-configured request timeout attached to a model. */
   resolveModelRequestTimeoutMs(model: Model): number | undefined;
+  /** Resolves host-managed proxy and destination TLS options for a WebSocket request. */
+  resolveWebSocketConnectionOptions(model: Model): AiWebSocketConnectionOptions | undefined;
   /** Reports whether the model carries host-managed proxy, TLS, or local-service state. */
   requiresManagedTransport(model: Model): boolean;
   /** Copies host-owned managed-transport state onto a projected model. */
@@ -255,6 +269,7 @@ const inertAiTransportHost: ActiveAiTransportHost = {
     ...(precedence === "caller-wins" ? callerHeaders : providerHeaders),
   }),
   resolveModelRequestTimeoutMs: () => undefined,
+  resolveWebSocketConnectionOptions: () => undefined,
   requiresManagedTransport: () => false,
   inheritManagedTransport: (_source, target) => target,
   transformTransportMessages: (messages, model, normalizeToolCallId) =>

@@ -4,6 +4,7 @@ import {
   type AiProviderRequestCapabilities,
 } from "@openclaw/ai";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { createNodeProxyAgent } from "../infra/net/node-proxy-agent.js";
 import "../llm/ai-transport-host.js";
 import { getModelProviderRuntimePluginHandle } from "../plugins/provider-hook-runtime.js";
 import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
@@ -85,6 +86,54 @@ export function configureAiTransportRuntimeHost(): void {
         capability: "llm",
         transport: "stream",
       }).headers,
+    resolveWebSocketConnectionOptions: (model) => {
+      if (getModelProviderLocalService(model)) {
+        throw new Error("Responses WebSocket does not support provider local-service routing");
+      }
+      const policy = resolveProviderRequestPolicyConfig({
+        provider: model.provider,
+        api: model.api,
+        baseUrl: model.baseUrl,
+        capability: "llm",
+        transport: "websocket",
+        request: getModelProviderRequestTransport(model),
+        routeFacts: getModelProviderRequestRouteFacts(model),
+      });
+      if (policy.proxy.configured && policy.proxy.tls.configured) {
+        throw new Error("Responses WebSocket cannot faithfully apply configured proxy TLS policy");
+      }
+      const agent = policy.proxy.configured
+        ? policy.proxy.mode === "explicit-proxy"
+          ? createNodeProxyAgent({
+              mode: "explicit",
+              proxyUrl: policy.proxy.proxyUrl,
+              protocol: "https",
+            })
+          : createNodeProxyAgent({
+              mode: "env",
+              targetUrl: model.baseUrl,
+              protocol: "https",
+            })
+        : createNodeProxyAgent({ mode: "env", targetUrl: model.baseUrl });
+      if (policy.proxy.configured && policy.proxy.mode === "env-proxy" && !agent) {
+        throw new Error("Responses WebSocket env-proxy mode has no applicable proxy route");
+      }
+      return {
+        ...(agent ? { agent } : {}),
+        ...(policy.tls.configured
+          ? {
+              ...(policy.tls.ca !== undefined ? { ca: policy.tls.ca } : {}),
+              ...(policy.tls.cert !== undefined ? { cert: policy.tls.cert } : {}),
+              ...(policy.tls.key !== undefined ? { key: policy.tls.key } : {}),
+              ...(policy.tls.passphrase !== undefined ? { passphrase: policy.tls.passphrase } : {}),
+              ...(policy.tls.serverName !== undefined ? { servername: policy.tls.serverName } : {}),
+              ...(policy.tls.rejectUnauthorized !== undefined
+                ? { rejectUnauthorized: policy.tls.rejectUnauthorized }
+                : {}),
+            }
+          : {}),
+      };
+    },
     requiresManagedTransport: (model) => {
       const request = getModelProviderRequestTransport(model);
       return Boolean(request?.proxy || request?.tls || getModelProviderLocalService(model));

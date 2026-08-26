@@ -4,6 +4,7 @@ import type {
   ResponsesServerEvent,
 } from "openai/resources/responses/responses.js";
 import { ResponsesWS } from "openai/resources/responses/ws.js";
+import type { ResponsesWSClientOptions } from "openai/resources/responses/ws.js";
 import { getAiTransportHost, resolveAiTransportHeaderSentinels } from "../host.js";
 import { registerSessionResourceCleanup } from "../session-resources.js";
 import {
@@ -71,6 +72,46 @@ function isOfficialOpenAIResponsesBaseUrl(baseUrl: string | undefined): boolean 
     return false;
   }
 }
+
+function isSecureResponsesV1BaseUrl(baseUrl: string | undefined): boolean {
+  if (!baseUrl) {
+    return false;
+  }
+  try {
+    const url = new URL(baseUrl);
+    return (
+      url.protocol === "https:" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.search === "" &&
+      url.hash === "" &&
+      url.pathname.replace(/\/+$/, "") === "/v1"
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function supportsCustomOpenAIResponsesWebSocket(params: {
+  provider: string;
+  api: string;
+  baseUrl?: string;
+  compat?: unknown;
+}): boolean {
+  const compat =
+    params.compat && typeof params.compat === "object"
+      ? (params.compat as Record<string, unknown>)
+      : undefined;
+  return (
+    params.api === "openai-responses" &&
+    !(
+      params.provider.trim().toLowerCase() === "openai" &&
+      isOfficialOpenAIResponsesBaseUrl(params.baseUrl)
+    ) &&
+    compat?.supportsResponsesWebSocket === true &&
+    isSecureResponsesV1BaseUrl(params.baseUrl)
+  );
+}
 export function supportsNativeOpenAIResponsesEndpoint(params: {
   provider: string;
   api: string;
@@ -126,19 +167,25 @@ type PreparedWebSocketConnection = {
 function prepareWebSocketConnection(
   client: OpenAI,
   headers: Record<string, string> | undefined,
+  customEndpoint: boolean,
 ): PreparedWebSocketConnection {
-  if (!isOfficialOpenAIResponsesBaseUrl(client.baseURL)) {
-    throw new Error("OpenAI Responses WebSocket requires the official API endpoint");
+  const eligible = customEndpoint
+    ? isSecureResponsesV1BaseUrl(client.baseURL)
+    : isOfficialOpenAIResponsesBaseUrl(client.baseURL);
+  if (!eligible) {
+    throw new Error("OpenAI Responses WebSocket requires an eligible Responses endpoint");
   }
   if (typeof client.apiKey !== "string" || client.apiKey.length === 0) {
     throw new Error("OpenAI Responses WebSocket requires an API key");
   }
   const resolvedApiKey = getAiTransportHost().resolveSecretSentinel(client.apiKey);
   const resolvedHeaders = { ...resolveAiTransportHeaderSentinels(headers) };
-  for (const key of Object.keys(resolvedHeaders)) {
-    const normalizedKey = key.toLowerCase();
-    if (normalizedKey === "authorization" || normalizedKey === "traceparent") {
-      delete resolvedHeaders[key];
+  if (!customEndpoint) {
+    for (const key of Object.keys(resolvedHeaders)) {
+      const normalizedKey = key.toLowerCase();
+      if (normalizedKey === "authorization" || normalizedKey === "traceparent") {
+        delete resolvedHeaders[key];
+      }
     }
   }
   if (!resolvedApiKey) {
@@ -161,13 +208,19 @@ function prepareWebSocketConnection(
 function createWebSocket(
   connection: PreparedWebSocketConnection,
   onError: (socket: ResponsesWS) => void,
+  connectionOptions?: ResponsesWSClientOptions,
 ): ResponsesWS {
   // openai's dual ESM declaration paths give the same runtime client two nominal
   // private-field types under NodeNext resolution. The SDK constructor receives
   // the actual OpenAI instance; bridge only that declaration mismatch here.
   const socket = new ResponsesWS(
     connection.client as unknown as ConstructorParameters<typeof ResponsesWS>[0],
-    { headers: connection.headers, maxQueueSize: 1 },
+    {
+      ...connectionOptions,
+      headers: connection.headers,
+      maxQueueSize: 1,
+      reconnect: null,
+    },
   );
   // The SDK async iterator removes its own listeners after every response while
   // cached sockets remain open. Keep one lifetime listener so an idle socket
@@ -184,9 +237,14 @@ type WebSocketLease = {
   release: (options?: { keep?: boolean }) => void;
 };
 
-function createTransientWebSocketLease(connection: PreparedWebSocketConnection): WebSocketLease {
-  const socket = createWebSocket(connection, (failedSocket) =>
-    closeWebSocketSilently(failedSocket, "transport_error"),
+function createTransientWebSocketLease(
+  connection: PreparedWebSocketConnection,
+  connectionOptions?: ResponsesWSClientOptions,
+): WebSocketLease {
+  const socket = createWebSocket(
+    connection,
+    (failedSocket) => closeWebSocketSilently(failedSocket, "transport_error"),
+    connectionOptions,
   );
   return {
     socket,
@@ -224,10 +282,11 @@ function acquireWebSocket(
     sessionId?: string;
   },
   connection: PreparedWebSocketConnection,
+  connectionOptions?: ResponsesWSClientOptions,
 ): WebSocketLease {
   const useCache = params.mode !== "websocket" && Boolean(params.sessionId);
   if (!useCache || !params.sessionId) {
-    return createTransientWebSocketLease(connection);
+    return createTransientWebSocketLease(connection, connectionOptions);
   }
 
   const cacheKey = `${params.sessionId}\0${connection.identity}`;
@@ -238,7 +297,7 @@ function acquireWebSocket(
       cached.idleTimer = undefined;
     }
     if (cached.busy) {
-      return createTransientWebSocketLease(connection);
+      return createTransientWebSocketLease(connection, connectionOptions);
     }
     const expired = Date.now() - cached.createdAt >= SESSION_WEBSOCKET_MAX_AGE_MS;
     if (!expired && cached.socket.socket.readyState === WEBSOCKET_OPEN_STATE) {
@@ -247,14 +306,18 @@ function acquireWebSocket(
     invalidateOwnedWebSocketSession(cacheKey, cached, expired ? "connection_age_limit" : "done");
   }
 
-  const socket = createWebSocket(connection, (failedSocket) => {
-    const failedEntry = websocketSessionCache.get(cacheKey);
-    if (failedEntry?.socket === failedSocket) {
-      invalidateOwnedWebSocketSession(cacheKey, failedEntry, "transport_error");
-    } else {
-      closeWebSocketSilently(failedSocket, "transport_error");
-    }
-  });
+  const socket = createWebSocket(
+    connection,
+    (failedSocket) => {
+      const failedEntry = websocketSessionCache.get(cacheKey);
+      if (failedEntry?.socket === failedSocket) {
+        invalidateOwnedWebSocketSession(cacheKey, failedEntry, "transport_error");
+      } else {
+        closeWebSocketSilently(failedSocket, "transport_error");
+      }
+    },
+    connectionOptions,
+  );
   const entry = {
     socket,
     sessionId: params.sessionId,
@@ -265,8 +328,14 @@ function acquireWebSocket(
   return createCachedWebSocketLease(cacheKey, entry, false);
 }
 
-function sanitizeWebSocketRequest(request: Record<string, unknown>): ResponsesContinuationRequest {
+function sanitizeWebSocketRequest(
+  request: Record<string, unknown>,
+  dropPreviousResponseId: boolean,
+): ResponsesContinuationRequest {
   const { stream: _stream, background: _background, ...websocketRequest } = request;
+  if (dropPreviousResponseId) {
+    delete websocketRequest.previous_response_id;
+  }
   return websocketRequest as ResponsesContinuationRequest;
 }
 
@@ -323,9 +392,12 @@ export function createOpenAIResponsesWebSocketStream(params: {
   signal?: AbortSignal;
   callerSignal?: AbortSignal;
   degradeCooldownMs?: number;
+  customEndpoint?: boolean;
+  connectionOptions?: ResponsesWSClientOptions;
 }): OpenAIResponsesWebSocketStream {
-  const connection = prepareWebSocketConnection(params.client, params.headers);
-  const fullRequest = sanitizeWebSocketRequest(params.request);
+  const customEndpoint = params.customEndpoint === true;
+  const connection = prepareWebSocketConnection(params.client, params.headers, customEndpoint);
+  const fullRequest = sanitizeWebSocketRequest(params.request, customEndpoint);
   const requestModel = typeof fullRequest.model === "string" ? fullRequest.model : "";
   const degradationKey = `${params.sessionId ?? ""}\0${connection.identity}\0${requestModel}`;
   const degraded = degradedWebSocketConnections.get(degradationKey);
@@ -347,7 +419,7 @@ export function createOpenAIResponsesWebSocketStream(params: {
   };
   let lease: ReturnType<typeof acquireWebSocket>;
   try {
-    lease = acquireWebSocket(params, connection);
+    lease = acquireWebSocket(params, connection, params.connectionOptions);
   } catch (error) {
     markDegraded();
     throw new OpenAIResponsesWebSocketPreDispatchError(error);
@@ -453,10 +525,10 @@ export function createOpenAIResponsesWebSocketStream(params: {
         }
         throw new OpenAIResponsesWebSocketPostDispatchError(error);
       } finally {
-        await iterator.return?.().catch(() => undefined);
         if (!terminalReceived) {
           finish({ keep: false });
         }
+        await iterator.return?.().catch(() => undefined);
       }
     },
   };

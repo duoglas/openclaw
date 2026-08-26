@@ -59,6 +59,7 @@ import { observeResponsesStream } from "./openai-responses-stream-observer-inter
 import {
   createOpenAIResponsesWebSocketStream,
   type OpenAIResponsesWebSocketMode,
+  supportsCustomOpenAIResponsesWebSocket,
   supportsNativeOpenAIResponsesEndpoint,
 } from "./openai-responses-websocket.js";
 import {
@@ -86,19 +87,27 @@ import { redactIdentifier } from "./transport-utils.js";
 function resolveNativeOpenAIResponsesWebSocketMode(
   model: Model,
   transport: OpenAIResponsesOptions["transport"],
-): OpenAIResponsesWebSocketMode | undefined {
+): { mode: OpenAIResponsesWebSocketMode; customEndpoint: boolean } | undefined {
   if (transport !== "websocket" && transport !== "websocket-cached" && transport !== "auto") {
     return undefined;
   }
-  if (getAiTransportHost().requiresManagedTransport(model)) {
-    return undefined;
-  }
-  return supportsNativeOpenAIResponsesEndpoint({
+  const official = supportsNativeOpenAIResponsesEndpoint({
     provider: model.provider,
     api: model.api,
     baseUrl: model.baseUrl,
+  });
+  if (official) {
+    return getAiTransportHost().requiresManagedTransport(model)
+      ? undefined
+      : { mode: transport, customEndpoint: false };
+  }
+  return supportsCustomOpenAIResponsesWebSocket({
+    provider: model.provider,
+    api: model.api,
+    baseUrl: model.baseUrl,
+    compat: model.compat,
   })
-    ? transport
+    ? { mode: "websocket", customEndpoint: true }
     : undefined;
 }
 
@@ -481,12 +490,16 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
             const websocket = createOpenAIResponsesWebSocketStream({
               client,
               request: params,
-              mode: websocketMode,
+              mode: websocketMode.mode,
               sessionId: options?.sessionId,
               headers: websocketHeaders,
               signal: websocketSignal,
               callerSignal: options?.signal,
               degradeCooldownMs: websocketSessionPolicy?.degradeCooldownMs,
+              customEndpoint: websocketMode.customEndpoint,
+              connectionOptions: websocketMode.customEndpoint
+                ? getAiTransportHost().resolveWebSocketConnectionOptions(model)
+                : undefined,
             });
             finishWebSocket = websocket.finish;
             observePrompt?.(websocket.request, {
@@ -497,7 +510,7 @@ function createResponsesTransportExecutor(config: ResponsesTransportExecutorOpti
             emitModelTransportDebug(
               log,
               `[responses] websocket_selected provider=${model.provider} api=${model.api} model=${model.id} ` +
-                `mode=${websocketMode} reused=${websocket.reusedConnection} ` +
+                `mode=${websocketMode.mode} reused=${websocket.reusedConnection} ` +
                 `continuation=${websocket.continuationStatus === "continued"} continuationStatus=${websocket.continuationStatus} ` +
                 `sessionIdHash=${redactIdentifier(options?.sessionId)} ` +
                 `headersHash=${redactIdentifier(JSON.stringify(Object.entries(websocketHeaders ?? {}).toSorted(([a], [b]) => a.localeCompare(b))))}`,

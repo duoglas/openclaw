@@ -7,7 +7,7 @@ const websocketState = vi.hoisted(() => ({
     emitError(error: Error): void;
   }>,
   clients: [] as Array<{ apiKey?: string }>,
-  options: [] as Array<{ headers?: Record<string, string> }>,
+  options: [] as Array<Record<string, unknown> & { headers?: Record<string, string> }>,
   requests: [] as Array<Record<string, unknown>>,
   responseBatches: [] as Array<Array<Record<string, unknown>>>,
 }));
@@ -18,6 +18,7 @@ vi.mock("openai/resources/responses/ws.js", () => ({
     closed = false;
     private events: Array<Record<string, unknown>> = [];
     private errorListeners: Array<(error: Error) => void> = [];
+    private releasePendingRead: (() => void) | undefined;
 
     constructor(client: { apiKey?: string }, options: { headers?: Record<string, string> }) {
       websocketState.instances.push(this);
@@ -33,6 +34,7 @@ vi.mock("openai/resources/responses/ws.js", () => ({
     close() {
       this.closed = true;
       this.socket.readyState = 3;
+      this.releasePendingRead?.();
     }
 
     on(event: string, listener: (error: Error) => void) {
@@ -50,9 +52,17 @@ vi.mock("openai/resources/responses/ws.js", () => ({
 
     stream() {
       const readEvents = () => this.events;
+      const waitForRelease = () =>
+        new Promise<void>((resolve) => {
+          this.releasePendingRead = resolve;
+        });
       return (async function* () {
         yield { type: "open" as const };
         for (const message of readEvents()) {
+          if (message.type === "test.pending") {
+            await waitForRelease();
+            continue;
+          }
           yield { type: "message" as const, message };
         }
       })();
@@ -64,6 +74,7 @@ import { configureAiTransportHost, getAiTransportHost } from "../host.js";
 import { cleanupSessionResources } from "../session-resources.js";
 import {
   createOpenAIResponsesWebSocketStream,
+  supportsCustomOpenAIResponsesWebSocket,
   supportsNativeOpenAIResponsesEndpoint,
 } from "./openai-responses-websocket.js";
 
@@ -160,6 +171,65 @@ describe("native OpenAI Responses WebSocket transport", () => {
     ).toBe(false);
   });
 
+  it("requires explicit custom-provider opt-in on a secure exact v1 endpoint", () => {
+    expect(
+      supportsCustomOpenAIResponsesWebSocket({
+        provider: "custom",
+        api: "openai-responses",
+        baseUrl: "https://compatible.example/v1/",
+        compat: { supportsResponsesWebSocket: true },
+      }),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["missing opt-in", "custom", "openai-responses", "https://compatible.example/v1", {}],
+    [
+      "insecure endpoint",
+      "custom",
+      "openai-responses",
+      "http://compatible.example/v1",
+      { supportsResponsesWebSocket: true },
+    ],
+    [
+      "wrong path",
+      "custom",
+      "openai-responses",
+      "https://compatible.example/v2",
+      { supportsResponsesWebSocket: true },
+    ],
+    [
+      "URL credentials",
+      "custom",
+      "openai-responses",
+      "https://user:pass@compatible.example/v1",
+      { supportsResponsesWebSocket: true },
+    ],
+    [
+      "URL query",
+      "custom",
+      "openai-responses",
+      "https://compatible.example/v1?q=x",
+      { supportsResponsesWebSocket: true },
+    ],
+    [
+      "wrong API",
+      "custom",
+      "openai-completions",
+      "https://compatible.example/v1",
+      { supportsResponsesWebSocket: true },
+    ],
+    [
+      "official endpoint",
+      "openai",
+      "openai-responses",
+      "https://api.openai.com/v1",
+      { supportsResponsesWebSocket: true },
+    ],
+  ])("rejects custom WebSocket eligibility for %s", (_name, provider, api, baseUrl, compat) => {
+    expect(supportsCustomOpenAIResponsesWebSocket({ provider, api, baseUrl, compat })).toBe(false);
+  });
+
   it("rejects an effective SDK client endpoint that is not the official API", () => {
     const compatibleClient = {
       ...clientFixture,
@@ -172,7 +242,7 @@ describe("native OpenAI Responses WebSocket transport", () => {
         request: { model: "gpt-5.6-luna", input: [firstUser] },
         mode: "websocket",
       }),
-    ).toThrow("official API endpoint");
+    ).toThrow("eligible Responses endpoint");
     expect(websocketState.instances).toHaveLength(0);
   });
 
@@ -205,6 +275,95 @@ describe("native OpenAI Responses WebSocket transport", () => {
     expect(websocketState.options[0]?.headers).toEqual({
       "x-provider-auth": "resolved-header",
     });
+  });
+
+  it("resolves rotating credentials independently for every transient handshake", async () => {
+    let currentKey = "first-key";
+    configureAiTransportHost({
+      ...initialHost,
+      resolveSecretSentinel: (value) => (value === "ROTATING_KEY" ? currentKey : value),
+    });
+    websocketState.responseBatches.push([completion("resp_1")], [completion("resp_2")]);
+    const rotatingClient = {
+      apiKey: "ROTATING_KEY",
+      baseURL: "https://compatible.example/v1",
+      withOptions(options: { apiKey?: string }) {
+        return { ...this, ...options };
+      },
+    };
+
+    await consumeResponse(
+      createOpenAIResponsesWebSocketStream({
+        client: rotatingClient as never,
+        request: { model: "custom", input: [firstUser] },
+        mode: "websocket",
+        customEndpoint: true,
+      }),
+    );
+    currentKey = "second-key";
+    await consumeResponse(
+      createOpenAIResponsesWebSocketStream({
+        client: rotatingClient as never,
+        request: { model: "custom", input: [firstUser] },
+        mode: "websocket",
+        customEndpoint: true,
+      }),
+    );
+
+    expect(websocketState.clients.map((entry) => entry.apiKey)).toEqual([
+      "first-key",
+      "second-key",
+    ]);
+  });
+
+  it("closes the socket to unblock an aborted pending read", async () => {
+    websocketState.responseBatches.push([{ type: "test.pending" }]);
+    const controller = new AbortController();
+    const response = createOpenAIResponsesWebSocketStream({
+      client,
+      request: { model: "gpt-5.6-luna", input: [firstUser] },
+      mode: "websocket",
+      signal: controller.signal,
+      callerSignal: controller.signal,
+    });
+    const pending = response.stream[Symbol.asyncIterator]().next();
+    await vi.waitFor(() => expect(websocketState.requests).toHaveLength(1));
+    controller.abort(new Error("abort-contract"));
+
+    const result = await Promise.race([
+      pending.then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+      new Promise<string>((resolve) => {
+        setTimeout(() => resolve("still-pending"), 50);
+      }),
+    ]);
+    expect(result).toMatch(/abort/i);
+    expect(websocketState.instances[0]?.closed).toBe(true);
+  });
+
+  it("closes the socket to unblock a timed-out pending read", async () => {
+    websocketState.responseBatches.push([{ type: "test.pending" }]);
+    const response = createOpenAIResponsesWebSocketStream({
+      client,
+      request: { model: "gpt-5.6-luna", input: [firstUser] },
+      mode: "websocket",
+      signal: AbortSignal.timeout(5),
+    });
+
+    const pending = response.stream[Symbol.asyncIterator]().next();
+    const result = await Promise.race([
+      pending.then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      ),
+      new Promise<string>((resolve) => {
+        setTimeout(() => resolve("still-pending"), 50);
+      }),
+    ]);
+    expect(result).not.toBe("still-pending");
+    expect(websocketState.instances[0]?.closed).toBe(true);
   });
 
   it("continues across equivalent request ordering, omissions, and persisted reasoning replay", async () => {

@@ -772,6 +772,36 @@ describe("native OpenAI Responses WebSocket client integration", () => {
     expect(transportState.sdkRequests).toHaveLength(1);
   });
 
+  it("preserves incomplete terminal semantics across WebSocket and SSE", async () => {
+    const incompleteEvent = {
+      type: "response.incomplete",
+      response: {
+        id: "resp_incomplete",
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        output: [],
+        usage: { input_tokens: 9, output_tokens: 7, total_tokens: 16 },
+      },
+    };
+    transportState.responseBatches.push([message(incompleteEvent)]);
+    transportState.sdkOutcomes.push(sdkEvent(incompleteEvent));
+
+    const websocket = await run({ messages: [userMessage("websocket", 1)], tools: [] });
+    const sse = await run({ messages: [userMessage("sse", 2)], tools: [] }, { transport: "sse" });
+
+    expect(websocket).toMatchObject({
+      stopReason: "length",
+      responseId: "resp_incomplete",
+      usage: { input: 9, output: 7, totalTokens: 16 },
+    });
+    expect(sse).toMatchObject({
+      stopReason: "length",
+      responseId: "resp_incomplete",
+      usage: { input: 9, output: 7, totalTokens: 16 },
+    });
+    expect(transportState.sdkRequests).toHaveLength(1);
+  });
+
   it("preserves failed terminal semantics across WebSocket and SSE without degradation", async () => {
     const failedEvent = {
       type: "response.failed",
@@ -855,6 +885,28 @@ describe("native OpenAI Responses WebSocket client integration", () => {
     expect(transportState.sdkRequests).toEqual([]);
   });
 
+  it("does not replay or fall back after custom response.create", async () => {
+    const compatibleModel = {
+      ...model,
+      provider: "compatible",
+      baseUrl: "https://compatible.example/v1",
+      compat: { supportsResponsesWebSocket: true },
+    } as unknown as Model<"openai-responses">;
+    transportState.responseBatches.push([{ type: "close", code: 1006 }]);
+
+    const result = await run(
+      { messages: [userMessage("hello", 1)], tools: [] },
+      { model: compatibleModel, transport: "auto" },
+    );
+
+    expect(result).toMatchObject({
+      stopReason: "error",
+      errorCode: PROVIDER_POST_DISPATCH_AMBIGUITY_ERROR_CODE,
+    });
+    expect(transportState.websocketRequests).toHaveLength(1);
+    expect(transportState.sdkRequests).toEqual([]);
+  });
+
   it("keeps custom OpenAI-compatible endpoints on guarded SSE", async () => {
     transportState.sdkOutcomes.push(sdkCompletion("resp_sse"));
     const compatibleModel = { ...model, baseUrl: "https://compatible.example/v1" };
@@ -867,6 +919,80 @@ describe("native OpenAI Responses WebSocket client integration", () => {
     expect(result.stopReason).toBe("stop");
     expect(transportState.websocketClients).toEqual([]);
     expect(transportState.sdkRequests).toHaveLength(1);
+  });
+
+  it("keeps resolved provider auth ahead of runtime WebSocket headers", async () => {
+    configureAiTransportHost({
+      ...getAiTransportHost(),
+      plugin: {
+        ...getAiTransportHost().plugin,
+        resolveTransportTurnState: () => ({
+          websocket: {
+            headers: {
+              Authorization: "Bearer runtime-must-not-win",
+              "x-runtime": "runtime-value",
+            },
+          },
+        }),
+      },
+    });
+    const compatibleModel = {
+      ...model,
+      provider: "compatible",
+      baseUrl: "https://compatible.example/v1",
+      compat: { supportsResponsesWebSocket: true },
+    } as unknown as Model<"openai-responses">;
+    transportState.responseBatches.push([message(completedEvent("resp_headers"))]);
+
+    const result = await run(
+      { messages: [userMessage("hello", 1)], tools: [] },
+      {
+        model: compatibleModel,
+        transport: "websocket",
+        headers: {
+          Authorization: "Bearer resolved-provider",
+          "x-provider": "provider-value",
+        },
+      },
+    );
+
+    expect(result.stopReason).toBe("stop");
+    expect(transportState.websocketOptions[0]?.headers).toMatchObject({
+      Authorization: "Bearer resolved-provider",
+      "x-provider": "provider-value",
+      "x-runtime": "runtime-value",
+    });
+    expect(JSON.stringify(transportState.websocketOptions[0]?.headers)).not.toContain(
+      "runtime-must-not-win",
+    );
+  });
+
+  it("uses transient WebSocket only for explicitly opted-in compatible endpoints", async () => {
+    const compatibleModel = {
+      ...model,
+      provider: "compatible",
+      baseUrl: "https://compatible.example/v1",
+      compat: { supportsResponsesWebSocket: true },
+    } as unknown as Model<"openai-responses">;
+    transportState.responseBatches.push(
+      [message(completedEvent("resp_custom_1"))],
+      [message(completedEvent("resp_custom_2"))],
+    );
+
+    await run(
+      { messages: [userMessage("first", 1)], tools: [] },
+      { model: compatibleModel, transport: "websocket-cached" },
+    );
+    await run(
+      { messages: [userMessage("second", 2)], tools: [] },
+      { model: compatibleModel, transport: "websocket-cached" },
+    );
+
+    expect(transportState.websocketClients).toHaveLength(2);
+    expect(transportState.websocketRequests).toHaveLength(2);
+    expect(transportState.websocketRequests[0]).not.toHaveProperty("previous_response_id");
+    expect(transportState.websocketRequests[1]).not.toHaveProperty("previous_response_id");
+    expect(transportState.sdkRequests).toEqual([]);
   });
 
   it("keeps host-managed proxy and TLS models on guarded SSE", async () => {

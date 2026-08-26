@@ -357,7 +357,10 @@ export function buildOpenAIClientHeaders(
       getAiTransportHost().buildCopilotDynamicHeaders(context.messages),
     );
   }
-  const callerHeaders = { ...optionHeaders, ...turnHeaders };
+  // Provider/request headers are already resolved at the request boundary and
+  // may carry final auth. Runtime turn headers can add tracing/session fields,
+  // but must not replace those resolved provider values.
+  const callerHeaders = { ...turnHeaders, ...optionHeaders };
   const headers = resolveProviderRequestPolicyConfig(model, {
     provider: model.provider,
     api: model.api,

@@ -126,6 +126,68 @@ afterEach(() => {
 });
 
 describe("ModelRegistry models.json auth", () => {
+  it("merges provider-level Responses compatibility into authored models", () => {
+    const modelsPath = writeModelsJson({
+      providers: {
+        custom: {
+          baseUrl: "https://compatible.example/v1",
+          api: "openai-responses",
+          compat: {
+            supportsResponsesWebSocket: true,
+            supportsTemperature: false,
+          },
+          models: [
+            {
+              id: "custom-responses",
+              compat: { supportsTemperature: true },
+            },
+          ],
+        },
+      },
+    });
+
+    const registry = ModelRegistry.create(AuthStorage.inMemory(), modelsPath);
+
+    expect(registry.getError()).toBeUndefined();
+    expect(registry.find("custom", "custom-responses")?.compat).toMatchObject({
+      supportsResponsesWebSocket: true,
+      supportsTemperature: true,
+    });
+  });
+
+  it("merges provider-level Responses compatibility into dynamically registered models", () => {
+    const registry = ModelRegistry.create(
+      AuthStorage.inMemory(),
+      writeModelsJson({ providers: {} }),
+    );
+
+    registry.registerProvider("dynamic-custom", {
+      baseUrl: "https://compatible.example/v1",
+      api: "openai-responses",
+      compat: {
+        supportsResponsesWebSocket: true,
+        supportsTemperature: false,
+      },
+      models: [
+        {
+          id: "custom-responses",
+          name: "Custom Responses",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128_000,
+          maxTokens: 8_192,
+          compat: { supportsTemperature: true },
+        },
+      ],
+    });
+
+    expect(registry.find("dynamic-custom", "custom-responses")?.compat).toMatchObject({
+      supportsResponsesWebSocket: true,
+      supportsTemperature: true,
+    });
+  });
+
   it("accepts Bedrock AWS SDK auth without apiKey", async () => {
     // AWS SDK credential resolution is provider-owned; requiring an apiKey here
     // would make Bedrock catalogs impossible to express in models.json.
@@ -587,7 +649,7 @@ describe("ModelRegistry models.json auth", () => {
     });
   });
 
-  it("preserves response-model temperature compatibility from generated catalogs", () => {
+  it("preserves response-model compatibility from generated catalogs", () => {
     const modelsPath = writeModelsJsonWithPluginCatalog({
       root: { providers: {} },
       pluginRelativePath: join("plugins", "openai", PLUGIN_MODEL_CATALOG_FILE),
@@ -602,7 +664,10 @@ describe("ModelRegistry models.json auth", () => {
               {
                 id: "gpt-5.6-luna",
                 name: "GPT-5.6 Luna",
-                compat: { supportsTemperature: false },
+                compat: {
+                  supportsTemperature: false,
+                  supportsResponsesWebSocket: true,
+                },
               },
             ],
           },
@@ -619,6 +684,7 @@ describe("ModelRegistry models.json auth", () => {
     expect(registry.getError()).toBeUndefined();
     expect(registry.find("openai", "gpt-5.6-luna")?.compat).toMatchObject({
       supportsTemperature: false,
+      supportsResponsesWebSocket: true,
     });
   });
 

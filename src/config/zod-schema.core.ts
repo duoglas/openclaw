@@ -275,6 +275,7 @@ const ModelCompatSchema = z
     codeMode: z.enum(["preferred", "capable"]).optional(),
     supportsStrictMode: z.boolean().optional(),
     supportsJsonSchemaResponseFormat: z.boolean().optional(),
+    supportsResponsesWebSocket: z.boolean().optional(),
     requiresStringContent: z.boolean().optional(),
     strictMessageKeys: z.boolean().optional(),
     visibleReasoningDetailTypes: z.array(z.string().min(1)).optional(),

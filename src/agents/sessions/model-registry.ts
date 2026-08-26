@@ -139,6 +139,7 @@ const OpenAIResponsesCompatSchema = Type.Object({
   supportsTemperature: Type.Optional(Type.Boolean()),
   sendSessionIdHeader: Type.Optional(Type.Boolean()),
   supportsLongCacheRetention: Type.Optional(Type.Boolean()),
+  supportsResponsesWebSocket: Type.Optional(Type.Boolean()),
 });
 
 const AnthropicMessagesCompatSchema = Type.Object({
@@ -1036,7 +1037,7 @@ export class ModelRegistry {
           maxTokens: modelDef.maxTokens,
           params: modelDef.params,
           headers: undefined,
-          compat: modelDef.compat,
+          compat: mergeCompat(config.compat, modelDef.compat),
         } as Model);
       }
 
@@ -1066,6 +1067,7 @@ export interface ProviderConfigInput {
     options?: SimpleStreamOptions,
   ) => AssistantMessageEventStreamContract;
   headers?: Record<string, string>;
+  compat?: Model["compat"];
   authHeader?: boolean;
   /** OAuth provider for /login support */
   oauth?: Omit<OAuthProviderInterface, "id">;

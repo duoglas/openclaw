@@ -526,6 +526,8 @@ export interface OpenAICompletionsCompat {
 export interface OpenAIResponsesCompat {
   /** Whether the provider supports the `developer` role (vs `system`). Default: true. */
   supportsDeveloperRole?: boolean;
+  /** Whether a compatible provider supports the Responses WebSocket transport. Default: false. */
+  supportsResponsesWebSocket?: boolean;
   /** Whether the model accepts the `temperature` parameter. Default: true. */
   supportsTemperature?: boolean;
   /** Whether to send the OpenAI `session_id` cache-affinity header from `options.sessionId` when caching is enabled. Default: true. */

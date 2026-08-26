@@ -88,6 +88,13 @@ source HEAD and status again during cleanup and fails if either changed.
 The script deliberately does not fetch. Fetch in a disposable checkout or CI
 checkout first, then pass the resulting local upstream ref.
 
+The fork `main` branch is the pinned, reviewed upstream base for the current
+candidate. Branch-push CI validates `fleet/responses-websocket` against that
+pinned base so a moving public `main` cannot invalidate an in-flight build.
+Public-upstream drift is checked separately by the fleet monitor; a drift alert
+starts the next rebase cycle but does not change the identity of an already
+validated candidate.
+
 ## Gate roles
 
 The fleet uses two complementary roles rather than treating a production host

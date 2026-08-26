@@ -37,11 +37,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch public upstream ref
+      - name: Fetch pinned fork base
         run: |
           set -euo pipefail
-          git remote add public-upstream https://github.com/openclaw/openclaw.git
-          git fetch --no-tags public-upstream main:refs/remotes/public-upstream/main
+          git fetch --no-tags origin main:refs/remotes/origin/main
 
       - name: Setup Node environment
         uses: ./.github/actions/setup-node-env
@@ -56,7 +55,7 @@ jobs:
       - name: Check maintenance freshness
         run: |
           scripts/fleet-ws-upgrade-check.sh status \
-            --upstream-ref refs/remotes/public-upstream/main
+            --upstream-ref refs/remotes/origin/main
 
       - name: Run isolated maintenance gate
         env:
@@ -65,7 +64,7 @@ jobs:
           set -euo pipefail
           gate="${DISPATCH_GATE:-light}"
           scripts/fleet-ws-upgrade-check.sh "dry-run-${gate}" \
-            --upstream-ref refs/remotes/public-upstream/main \
+            --upstream-ref refs/remotes/origin/main \
             --artifact-dir "${RUNNER_TEMP}/fleet-ws-artifacts"
 
       - name: Upload candidate identity artifact
